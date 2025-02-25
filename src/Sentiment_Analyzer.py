@@ -54,12 +54,18 @@ def extract_emojis(text):
 def determine_placement(text, positions):
     if not positions:
         return 'None'
+
+    # Calculate the start, middle, and end of the text
     length = len(text)
+    start_threshold = length // 3
+    end_threshold = 2 * length // 3
+
     placement = []
+
     for pos in positions:
-        if pos == 0:
+        if pos < start_threshold:
             placement.append('Start')
-        elif pos == length - 1:
+        elif pos >= end_threshold:
             placement.append('End')
         else:
             placement.append('Middle')
