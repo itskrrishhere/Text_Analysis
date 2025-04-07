@@ -7,10 +7,11 @@ import emoji
 import json
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import text2emotion as te
-from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tokenize import sent_tokenize
 from functools import lru_cache
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm  # For progress tracking
 
 # Download required NLTK resources
 nltk.download('punkt', quiet=True)
@@ -50,12 +51,19 @@ analyzer = SentimentIntensityAnalyzer()
 # -------------------------------
 # Data Loading and Preprocessing
 # -------------------------------
-def load_tweets(csv_file):
+def load_tweets(csv_file, chunksize):
     """
-    Load tweets from a CSV file.
+    Load tweets from a CSV file in chunks.
     Expects CSV to have at least 'id' and 'text' columns.
     """
-    return pd.read_csv(csv_file)
+    return pd.read_csv(csv_file, chunksize=chunksize)
+
+def count_tweets(csv_file):
+    """
+    Count the number of tweets (rows) in the CSV file (excluding header).
+    """
+    with open(csv_file, "r", encoding="utf-8") as f:
+        return sum(1 for _ in f) - 1
 
 # -------------------------------
 # Sentence and Chunk Tokenization
@@ -69,15 +77,15 @@ def split_sentence_into_chunks(sentence):
     Split a sentence into three roughly equal word chunks.
     For very short sentences, return the sentence as a single chunk.
     """
-    tokens = word_tokenize(sentence)
+    tokens = sentence.split()
     n = len(tokens)
     if n < 3:
         return [sentence]
     chunk_size = n // 3
     return [
         " ".join(tokens[:chunk_size]),
-        " ".join(tokens[chunk_size:2*chunk_size]),
-        " ".join(tokens[2*chunk_size:])
+        " ".join(tokens[chunk_size:2 * chunk_size]),
+        " ".join(tokens[2 * chunk_size:])
     ]
 
 # -------------------------------
@@ -192,7 +200,7 @@ def process_tweet(tweet_id, tweet_text):
         sentence_dict["dominant_emotion_without_emoji"] = sent_emotion_without
 
         chunks = split_sentence_into_chunks(sentence)
-        # Get a list of emoji placements for each chunk. Each element is a list of labels.
+        # Get a list of emoji placements for each chunk.
         placements = determine_emoji_placement(chunks)
 
         for i, chunk in enumerate(chunks):
@@ -202,7 +210,7 @@ def process_tweet(tweet_id, tweet_text):
 
             chunk_dict = {
                 "chunk_text": chunk,
-                "emoji_placements": placements[i],  # now a list of labels (or ["none"])
+                "emoji_placements": placements[i],
                 "sentiment_with_emoji": sentiment_with,
                 "sentiment_without_emoji": sentiment_without,
                 "dominant_emotion_with_emoji": emotion_with,
@@ -214,106 +222,123 @@ def process_tweet(tweet_id, tweet_text):
     return tweet_result
 
 # -------------------------------
-# Aggregating Additional Research Insights
+# Incremental Aggregation Functions
 # -------------------------------
-def aggregate_insights(results):
+def update_aggregator(aggregator, tweet_result):
     """
-    Compute overall insights across all tweets:
-      - Frequency of emoji placements.
-      - Average sentiment compound score differences.
-      - Distribution of dominant emotions (with and without emoji).
+    Update the aggregated counters using a single tweet's result.
 
-    Returns:
-        A dictionary of aggregated insights.
+    Args:
+        aggregator (dict): Dictionary containing aggregated counters.
+        tweet_result (dict): Result from process_tweet.
     """
-    placement_counter = Counter()
-    emotion_counter_with = Counter()
-    emotion_counter_without = Counter()
-    sentiment_differences = []
-    total_chunks = 0
-
-    for tweet in results:
-        for sentence in tweet["sentences"]:
-            for chunk in sentence["chunks"]:
-                # Count each placement label (if the chunk has multiple, count them all)
-                for label in chunk["emoji_placements"]:
-                    placement_counter[label] += 1
-                comp_with = chunk["sentiment_with_emoji"].get("compound", 0)
-                comp_without = chunk["sentiment_without_emoji"].get("compound", 0)
-                sentiment_differences.append(comp_with - comp_without)
-                total_chunks += 1
-                if chunk["dominant_emotion_with_emoji"]:
-                    emotion_counter_with[chunk["dominant_emotion_with_emoji"]] += 1
-                if chunk["dominant_emotion_without_emoji"]:
-                    emotion_counter_without[chunk["dominant_emotion_without_emoji"]] += 1
-
-    avg_sentiment_diff = sum(sentiment_differences) / total_chunks if total_chunks > 0 else 0
-
-    insights = {
-        "total_tweets_processed": len(results),
-        "total_chunks_processed": total_chunks,
-        "emoji_placement_distribution": dict(placement_counter),
-        "average_sentiment_compound_difference": avg_sentiment_diff,
-        "dominant_emotion_distribution_with_emoji": dict(emotion_counter_with),
-        "dominant_emotion_distribution_without_emoji": dict(emotion_counter_without)
-    }
-    return insights
+    aggregator["total_tweets_processed"] += 1
+    for sentence in tweet_result["sentences"]:
+        for chunk in sentence["chunks"]:
+            for label in chunk["emoji_placements"]:
+                aggregator["emoji_placement_distribution"][label] += 1
+            comp_with = chunk["sentiment_with_emoji"].get("compound", 0)
+            comp_without = chunk["sentiment_without_emoji"].get("compound", 0)
+            aggregator["sentiment_diff_sum"] += (comp_with - comp_without)
+            aggregator["total_chunks_processed"] += 1
+            if chunk["dominant_emotion_with_emoji"]:
+                aggregator["dominant_emotion_distribution_with_emoji"][chunk["dominant_emotion_with_emoji"]] += 1
+            if chunk["dominant_emotion_without_emoji"]:
+                aggregator["dominant_emotion_distribution_without_emoji"][chunk["dominant_emotion_without_emoji"]] += 1
 
 # -------------------------------
-# Main Execution Function with Parallel Processing
+# Main Execution Function with Chunk Processing
 # -------------------------------
 def main():
-    # Load the tweets dataset (adjust file path as needed)
     input_file = Path("cleaned_data/all_cleaned_tweets.csv")
     if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    tweets_df = load_tweets(input_file)
-
-    # Verify required columns exist
-    if 'text' not in tweets_df.columns:
-        raise ValueError("CSV file must contain at least a 'text' column")
-
-    # Create tweet IDs if they don't exist
-    if 'id' not in tweets_df.columns:
-        tweets_df['id'] = range(1, len(tweets_df) + 1)
-
-    # Prepare a list of (id, text) tuples for processing
-    tweets_to_process = list(zip(tweets_df['id'], tweets_df['text']))
-    results = []
-
-    # Determine optimal workers (leave 3 CPU free)
-    max_workers = max(1, os.cpu_count() - 3) if hasattr(os, 'cpu_count') else 4
-
-    # Process tweets in parallel using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_tweet, tweet_id, tweet_text): (tweet_id, tweet_text)
-                   for tweet_id, tweet_text in tweets_to_process}
-
-        for future in as_completed(futures):
-            tweet_id, tweet_text = futures[future]
-            try:
-                tweet_result = future.result()
-                results.append(tweet_result)
-            except Exception as exc:
-                print(f"Tweet {tweet_id} processing generated an exception: {exc}")
-
-    # Ensure output directory exists
+    # Setup output file paths.
     output_dir = Path("output")
     output_dir.mkdir(parents=True, exist_ok=True)
+    results_file = output_dir / "tweet_analysis_results.jsonl"
+    insights_file = output_dir / "analysis_insights.json"
 
-    # Write detailed analysis results to JSON
-    with open(output_dir / "tweet_analysis_results.json", "w", encoding="utf-8") as outfile:
-        json.dump(results, outfile, indent=2, ensure_ascii=False)
+    # Count total tweets for the global progress bar.
+    total_tweets = count_tweets(input_file)
 
-    # Compute and save aggregated research insights
-    insights = aggregate_insights(results)
-    with open(output_dir / "analysis_insights.json", "w", encoding="utf-8") as outfile:
-        json.dump(insights, outfile, indent=2, ensure_ascii=False)
+    # Initialize aggregator for incremental statistics.
+    aggregator = {
+        "total_tweets_processed": 0,
+        "total_chunks_processed": 0,
+        "emoji_placement_distribution": Counter(),
+        "sentiment_diff_sum": 0.0,
+        "dominant_emotion_distribution_with_emoji": Counter(),
+        "dominant_emotion_distribution_without_emoji": Counter()
+    }
 
-    print(f"Analysis complete. Processed {len(results)} tweets.")
-    print(f"Detailed results saved to {output_dir/'tweet_analysis_results.json'}")
-    print(f"Aggregated insights saved to {output_dir/'analysis_insights.json'}")
+    # Open the output file in write mode to clear previous content.
+    with open(results_file, "w", encoding="utf-8") as outfile:
+        pass
+
+    chunksize = 2500  # Adjust based on memory and performance considerations.
+    reader = load_tweets(input_file, chunksize)
+
+    # Create a global progress bar for all tweets.
+    global_pbar = tqdm(total=total_tweets, desc="Processing tweets")
+
+    # Process CSV file in chunks.
+    for chunk in reader:
+        # Ensure required columns exist.
+        if 'text' not in chunk.columns:
+            raise ValueError("CSV file must contain at least a 'text' column")
+        if 'id' not in chunk.columns:
+            chunk['id'] = range(1, len(chunk) + 1)
+        tweets_to_process = list(zip(chunk['id'], chunk['text']))
+
+        # Process tweets in parallel for the current chunk.
+        chunk_results = []
+        max_workers = max(1, os.cpu_count() // 2) if hasattr(os, 'cpu_count') else 4
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_tweet, tweet_id, tweet_text): (tweet_id, tweet_text)
+                       for tweet_id, tweet_text in tweets_to_process}
+            for future in as_completed(futures):
+                tweet_id, tweet_text = futures[future]
+                try:
+                    tweet_result = future.result()
+                    chunk_results.append(tweet_result)
+                    # Update aggregator with the tweet result.
+                    update_aggregator(aggregator, tweet_result)
+                except Exception as exc:
+                    print(f"Tweet {tweet_id} processing generated an exception: {exc}")
+                finally:
+                    # Update the global progress bar for each tweet processed.
+                    global_pbar.update(1)
+
+        # Write the results for this chunk to disk (append mode).
+        with open(results_file, "a", encoding="utf-8") as outfile:
+            for tweet_result in chunk_results:
+                outfile.write(json.dumps(tweet_result) + "\n")
+        # Clear chunk_results to free memory.
+        del chunk_results
+
+    global_pbar.close()
+
+    # After processing all chunks, compute aggregated insights.
+    total_chunks = aggregator["total_chunks_processed"]
+    avg_sentiment_diff = (aggregator["sentiment_diff_sum"] / total_chunks) if total_chunks > 0 else 0
+    aggregated_insights = {
+        "total_tweets_processed": aggregator["total_tweets_processed"],
+        "total_chunks_processed": total_chunks,
+        "emoji_placement_distribution": dict(aggregator["emoji_placement_distribution"]),
+        "average_sentiment_compound_difference": avg_sentiment_diff,
+        "dominant_emotion_distribution_with_emoji": dict(aggregator["dominant_emotion_distribution_with_emoji"]),
+        "dominant_emotion_distribution_without_emoji": dict(aggregator["dominant_emotion_distribution_without_emoji"])
+    }
+
+    # Write aggregated insights to disk.
+    with open(insights_file, "w", encoding="utf-8") as outfile:
+        json.dump(aggregated_insights, outfile, indent=2, ensure_ascii=False)
+
+    print(f"Analysis complete. Processed {aggregator['total_tweets_processed']} tweets.")
+    print(f"Detailed results saved to {results_file}")
+    print(f"Aggregated insights saved to {insights_file}")
 
 if __name__ == '__main__':
     main()
