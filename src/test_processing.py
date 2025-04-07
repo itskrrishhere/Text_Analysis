@@ -83,17 +83,44 @@ def split_sentence_into_chunks(sentence):
 # -------------------------------
 # Emoji Detection and Placement
 # -------------------------------
-def contains_emoji(text):
-    """Return True if the text contains any emoji."""
-    return bool(emoji_pattern.search(text))
+def detect_emojis_in_text(text):
+    """
+    Find all emojis in the text.
+
+    Returns:
+        List of tuples: (emoji, start_index)
+    """
+    return [(match.group(), match.start()) for match in emoji_pattern.finditer(text)]
 
 def determine_emoji_placement(chunks):
     """
-    Check each chunk for emoji and return placements.
-    Each chunk is labeled as 'start', 'middle', 'end' if emoji is found; otherwise 'none'.
+    For each chunk, check and label every emoji found based on its relative position
+    within the chunk. For each emoji in the chunk, determine its placement:
+    - "start" if it appears in the first third,
+    - "middle" if it appears in the middle third,
+    - "end" if it appears in the final third.
+
+    Returns:
+        A list of lists; each inner list contains the labels for all emojis in that chunk.
+        If no emoji is found in a chunk, returns ["none"].
     """
-    labels = ['start', 'middle', 'end']
-    return [labels[i] if contains_emoji(chunk) else "none" for i, chunk in enumerate(chunks)]
+    placements = []
+    for chunk in chunks:
+        emojis = detect_emojis_in_text(chunk)
+        if emojis:
+            chunk_length = len(chunk)
+            chunk_labels = []
+            for _, pos in emojis:
+                if pos < chunk_length / 3:
+                    chunk_labels.append("start")
+                elif pos < 2 * chunk_length / 3:
+                    chunk_labels.append("middle")
+                else:
+                    chunk_labels.append("end")
+            placements.append(chunk_labels)
+        else:
+            placements.append(["none"])
+    return placements
 
 # -------------------------------
 # Text Preprocessing with Caching
@@ -110,13 +137,15 @@ def get_sentiment_scores(text):
     """Compute sentiment scores using VADER."""
     return analyzer.polarity_scores(text)
 
-def analyze_sentiment(chunk):
+def analyze_sentiment(text):
     """
-    Analyze sentiment for a text chunk with and without emoji.
-    Returns tuple: (sentiment_with, sentiment_without)
+    Analyze sentiment for text with and without emoji.
+
+    Returns:
+        Tuple: (sentiment_with, sentiment_without)
     """
-    score_with = get_sentiment_scores(chunk)
-    score_without = get_sentiment_scores(remove_emojis(chunk))
+    score_with = get_sentiment_scores(text)
+    score_without = get_sentiment_scores(remove_emojis(text))
     return score_with, score_without
 
 # -------------------------------
@@ -125,7 +154,9 @@ def analyze_sentiment(chunk):
 def get_dominant_emotion(text):
     """
     Determine the dominant emotion in text using text2emotion.
-    Returns the emotion with the highest score.
+
+    Returns:
+        The emotion with the highest score, or None if not detected.
     """
     emotions = te.get_emotion(text)
     if emotions:
@@ -139,16 +170,29 @@ def process_tweet(tweet_id, tweet_text):
     """
     Process a tweet by:
       - Splitting into sentences and chunks.
-      - Analyzing emoji placement, sentiment (with/without emoji),
-        and dominant emotion (with/without emoji) per chunk.
-    Returns a dictionary with detailed results.
+      - Performing sentiment and emotion analysis for each sentence with and without emoji.
+      - Analyzing each chunk for emoji placement (detecting multiple emojis),
+        sentiment (with/without emoji), and dominant emotion (with/without emoji).
+
+    Returns:
+        A dictionary with detailed results.
     """
     sentences = split_into_sentences(tweet_text)
     tweet_result = {"tweet_id": tweet_id, "sentences": []}
 
     for sentence in sentences:
         sentence_dict = {"sentence": sentence, "chunks": []}
+        # Sentence-level analysis:
+        sent_sentiment_with, sent_sentiment_without = analyze_sentiment(sentence)
+        sent_emotion_with = get_dominant_emotion(sentence)
+        sent_emotion_without = get_dominant_emotion(remove_emojis(sentence))
+        sentence_dict["sentiment_with_emoji"] = sent_sentiment_with
+        sentence_dict["sentiment_without_emoji"] = sent_sentiment_without
+        sentence_dict["dominant_emotion_with_emoji"] = sent_emotion_with
+        sentence_dict["dominant_emotion_without_emoji"] = sent_emotion_without
+
         chunks = split_sentence_into_chunks(sentence)
+        # Get a list of emoji placements for each chunk. Each element is a list of labels.
         placements = determine_emoji_placement(chunks)
 
         for i, chunk in enumerate(chunks):
@@ -158,7 +202,7 @@ def process_tweet(tweet_id, tweet_text):
 
             chunk_dict = {
                 "chunk_text": chunk,
-                "emoji_placement": placements[i],
+                "emoji_placements": placements[i],  # now a list of labels (or ["none"])
                 "sentiment_with_emoji": sentiment_with,
                 "sentiment_without_emoji": sentiment_without,
                 "dominant_emotion_with_emoji": emotion_with,
@@ -178,7 +222,9 @@ def aggregate_insights(results):
       - Frequency of emoji placements.
       - Average sentiment compound score differences.
       - Distribution of dominant emotions (with and without emoji).
-    Returns a dictionary of aggregated insights.
+
+    Returns:
+        A dictionary of aggregated insights.
     """
     placement_counter = Counter()
     emotion_counter_with = Counter()
@@ -189,7 +235,9 @@ def aggregate_insights(results):
     for tweet in results:
         for sentence in tweet["sentences"]:
             for chunk in sentence["chunks"]:
-                placement_counter[chunk["emoji_placement"]] += 1
+                # Count each placement label (if the chunk has multiple, count them all)
+                for label in chunk["emoji_placements"]:
+                    placement_counter[label] += 1
                 comp_with = chunk["sentiment_with_emoji"].get("compound", 0)
                 comp_without = chunk["sentiment_without_emoji"].get("compound", 0)
                 sentiment_differences.append(comp_with - comp_without)
