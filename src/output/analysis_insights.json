@@ -1,0 +1,25 @@
+{
+  "total_tweets_processed": 20025,
+  "total_chunks_processed": 85167,
+  "emoji_placement_distribution": {
+    "none": 59960,
+    "end": 16066,
+    "start": 10408,
+    "middle": 5209
+  },
+  "average_sentiment_compound_difference": -0.05782471262343851,
+  "dominant_emotion_distribution_with_emoji": {
+    "Surprise": 5304,
+    "Sad": 5150,
+    "Happy": 66432,
+    "Fear": 6218,
+    "Angry": 2063
+  },
+  "dominant_emotion_distribution_without_emoji": {
+    "Surprise": 5462,
+    "Sad": 5264,
+    "Happy": 65971,
+    "Fear": 6361,
+    "Angry": 2109
+  }
+}
